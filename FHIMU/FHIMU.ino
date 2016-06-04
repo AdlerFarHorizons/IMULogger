@@ -6,10 +6,11 @@
 // This software is a modification of the software v053_MPU6000_DMP6_SPI.ino written by
 // Martin Crown, and available at
 // https://www.dropbox.com/s/a3cjxyue7lbiho5/v053_MPU6000_DMP6_SPI.ino
-// As he acknowledges before, he based his software heavily on another sketch by Jeff Rowberg.
+// As he acknowledges below, he based his software heavily on another sketch by Jeff Rowberg.
 //
 // An additional vector-based compass tilt correction was borrowed from Pololu at
 // https://github.com/pololu/lsm303-arduino/blob/master/LSM303/
+// This doesn't seem to work, and later Arduino versions won't compile the vector templates.
 //
 // This will run on an ArduIMU V3 board. It can be programmed via a 5V FTDI cable on the attached
 // header. In the Arduino IDE, use Arduino Duemilanove w/ ATmega328. (Some 5V FTDI cables use 3.3V
@@ -20,6 +21,7 @@
 // The ArduIMU board takes 5V in and can provide 3.3V to power a Copernicus GPS and/or
 // a level shifter. Logic on the ArduIMU board is 5V.
 //
+// I have integrated a Parallax MS5607 barometric pressure sensor using I2C.
 
 // ============================================================================================== //
 // Version v053 - August 9, 2013 
@@ -124,6 +126,7 @@
 #include <HMC5883LFH_T.h>
 HMC5883L compass;
 #define mag 0x1E //0011110b, I2C 7bit address of HMC5883
+#define PRESSURE_ADDR 0x76 //0x77
 
 // Magnetometer Corrections
 // Should be in EEPROM but we only have one board.
@@ -183,16 +186,14 @@ HMC5883L compass;
 //        yaw: -180 to +180
 #define OUTPUT_READABLE_ROLLPITCHYAW
 //
-// uncomment "#define OUTPUT_TEAPOT" if you want output that matches the format used for the
-// InvenSense Teapot demo - do not output anything else or the demo will not work
-// - output looks like garbage, for instance $?h þ  but this is just what is expected 
-// #define OUTPUT_TEAPOT
-//
 // uncomment "OUTPUT_MAGNETOMETER" if you want to see the magnetometer data from the HMC3883L
 #define OUTPUT_MAGNETOMETER
 //
 // uncomment "OUTPUT_GPS" if you want to see GPS input data interleaved in the output
 #define OUTPUT_GPS
+//
+// uncomment "OUTPUT_BARO" if you want to see barometric pressure and temperature
+#define OUTPUT_BARO
 //
 // ============================================================================================== //
 
@@ -447,9 +448,6 @@ unsigned int packetSize = 42; // number of unique bytes of data written by the D
 unsigned int fifoCount;       // count of all bytes currently in FIFO
 byte fifoBuffer[64];          // FIFO storage buffer (in fact only 42 used...)
 
-// packet structure for InvenSense Teapot demo
-byte teapotPacket[14] = { '$', 0x02, 0,0, 0,0, 0,0, 0,0, 0x00, 0x00, '\r', '\n' };
-
 // INTERRUPT FROM MPU-6000 DETECTION ROUTINE
 volatile boolean mpuInterrupt = false;     // indicates whether MPU interrupt pin has gone high
 void dmpDataReady()
@@ -462,10 +460,25 @@ uint32_t rowCount;
 char sentenceBuf[100];
 int sentenceBufIndex = 0;
 
+uint16_t C[7];
+uint32_t D1 = 0;
+uint32_t D2 = 0;
+float dT = 0;
+int32_t TEMP = 0;
+float OFF = 0; 
+float SENS = 0; 
+float P = 0;
+float T2  = 0;
+float OFF2  = 0;
+float SENS2 = 0;
+float Temperature;
+float Pressure;
+
 // ############################################################################################## //
 // ########################################## Vector Math ####################################### //
 // ############################################################################################## //
 
+/*
 template <typename T> struct vector
 {
   T x, y, z;
@@ -490,6 +503,7 @@ void vector_normalize(vector<float> *a)
   a->y /= magnitude;
   a->z /= magnitude;
 }
+*/
 
 // ############################################################################################## //
 // ################################ SETUP ####################################################### //
@@ -579,6 +593,34 @@ void setup()
     // set our DMP Ready flag so the main loop() function knows it's okay to use it
     dmpReady = true;
     Serial.println("DMP ready! Waiting for first data from MPU-6000...");
+
+#ifdef OUTPUT_BARO    
+    Serial.println("Configuring MS5607");
+    Serial.println("PRESSURE SENSOR PROM COEFFICIENTS");
+    Wire.beginTransmission(PRESSURE_ADDR);
+    Wire.write(0x1E); // reset
+    Wire.endTransmission();
+    delay(10);
+    for (int i=0; i<6  ; i++) {
+      Wire.beginTransmission(PRESSURE_ADDR);
+      Wire.write(0xA2 + (i * 2));
+      Wire.endTransmission();
+      Wire.beginTransmission(PRESSURE_ADDR);
+      Wire.requestFrom(PRESSURE_ADDR, (uint8_t) 6);
+      delay(1);
+      if(Wire.available())
+      {
+        C[i+1] = Wire.read() << 8 | Wire.read();
+      }
+      else {
+        Serial.println("Error reading PROM 1"); // error reading the PROM or communicating with the device
+      }
+      Serial.println(C[i+1]);
+    }
+    Serial.println();   
+    Serial.println("Done configuring MS5607");
+#endif
+    
     Serial.println(">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>");
 
     // show chosen outputs
@@ -607,9 +649,6 @@ void setup()
     #endif
     #ifdef OUTPUT_READABLE_YAWPITCHROLL
     Serial.println("- OUTPUT_READABLE_YAWPITCHROLL");
-    #endif
-    #ifdef OUTPUT_TEAPOT
-    Serial.println("- OUTPUT_TEAPOT");
     #endif
     Serial.println();
     */
@@ -737,6 +776,44 @@ void loop()
     int AcceX = ((fifoBuffer[28] << 8) + fifoBuffer[29]);
     int AcceY = ((fifoBuffer[32] << 8) + fifoBuffer[33]);
     int AcceZ = ((fifoBuffer[36] << 8) + fifoBuffer[37]);
+
+#ifdef OUTPUT_BARO
+        D1 = getVal(PRESSURE_ADDR, 0x48); // Pressure raw
+        D2 = getVal(PRESSURE_ADDR, 0x58);// Temperature raw
+
+        dT   = (float)D2 - ((uint32_t)C[5] * 256);
+        OFF  = ((float)C[2] * 131072) + ((dT * C[4]) / 64);
+        SENS = ((float)C[1] * 65536) + (dT * C[3] / 128);
+
+        TEMP = (int64_t)dT * (int64_t)C[6] / 8388608 + 2000;
+  
+        if(TEMP < 2000) // if temperature lower than 20 Celsius 
+        {
+    
+          T2=pow(dT,2)/2147483648;
+          OFF2=61*pow((TEMP-2000),2)/16;
+          SENS2=2*pow((TEMP-2000),2);
+    
+          if(TEMP < -1500) // if temperature lower than -15 Celsius 
+          {
+            OFF2=OFF2+15*pow((TEMP+1500),2);
+            SENS2=SENS2+8*pow((TEMP+1500),2);
+          }
+ 
+          TEMP = TEMP - T2;
+          OFF = OFF - OFF2; 
+          SENS = SENS - SENS2;
+        }
+ 
+        Temperature = (float)TEMP / 100; 
+  
+        P  = (D1 * SENS / 2097152 - OFF) / 32768;
+        Pressure = (float)P / 100;
+#endif
+
+
+
+    
     /*
     #ifdef OUTPUT_RAW_ACCEL
       // print accelerometer values from fifoBuffer
@@ -931,22 +1008,6 @@ void loop()
       #endif
     #endif
 
-    /*
-    #ifdef OUTPUT_TEAPOT
-      // display quaternion values in InvenSense Teapot demo format:
-      teapotPacket[2] = fifoBuffer[0];
-      teapotPacket[3] = fifoBuffer[1];
-      teapotPacket[4] = fifoBuffer[4];
-      teapotPacket[5] = fifoBuffer[5];
-      teapotPacket[6] = fifoBuffer[8];
-      teapotPacket[7] = fifoBuffer[9];
-      teapotPacket[8] = fifoBuffer[12];
-      teapotPacket[9] = fifoBuffer[13];
-      Serial.write(teapotPacket, 14);
-      teapotPacket[11]++; // packetCount, loops at 0xFF on purpose
-    #endif
-    */
-
     #ifdef OUTPUT_MAGNETOMETER
       // Retrive the raw values from the compass (not scaled).
       MagnetometerRaw raw = compass.ReadRawAxis();
@@ -1036,11 +1097,43 @@ void loop()
         Heading += 360;
       Serial.println(Heading);
       */
-      
       #ifdef OUTPUT_GPS
       checkSerial();
       #endif
     #endif   
+
+
+#ifdef OUTPUT_BARO
+      Serial.print("$FHPRS");
+      Serial.print(",");
+      Serial.print(rowCount);
+      Serial.print(",");
+      Serial.print(Temperature);
+      Serial.print(",");
+      Serial.print(Pressure);
+      Serial.print(",");
+      Serial.print(D2);
+      Serial.print(",");
+      Serial.print(D1);
+      Serial.print(",");
+      Serial.print(dT);
+      Serial.print(",");
+      Serial.print(SENS);
+      Serial.print(",");
+      Serial.print(OFF/100);
+      Serial.print(",");
+      Serial.print(T2);
+      Serial.print(",");
+      Serial.print(SENS2);
+      Serial.print(",");
+      Serial.println(OFF2/100);
+
+      #ifdef OUTPUT_GPS
+      checkSerial();
+      #endif
+#endif
+      
+
       
 // ============================================================================================== //
 // >>>>>>>>> - this would normally be the end of adding your own code into this sketch          >>>>
@@ -2038,6 +2131,35 @@ void checkSerial() {
       sentenceBufIndex = 0;
     }
   }     
+}
+
+
+// ############################################################################################## //
+// ################################ I2C Baro Function     ####################################### //
+// ############################################################################################## //
+
+long getVal(int address, byte code)
+{
+  unsigned long ret = 0;
+  Wire.beginTransmission(address);
+  Wire.write(code);
+  Wire.endTransmission();
+  delay(10);
+  // start read sequence
+  Wire.beginTransmission(address);
+  Wire.write((byte) 0x00);
+  Wire.endTransmission();
+  Wire.beginTransmission(address);
+  Wire.requestFrom(address, (int)3);
+  if (Wire.available() >= 3)
+  {
+    ret = Wire.read() * (unsigned long)65536 + Wire.read() * (unsigned long)256 + Wire.read();
+  }
+  else {
+    ret = -1;
+  }
+  Wire.endTransmission();
+  return ret;
 }
 
 // ############################################################################################## //
